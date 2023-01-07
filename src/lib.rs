@@ -1,6 +1,7 @@
 use anyhow::Result;
 use asynchronous_codec::{Decoder, Encoder};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::stream::{Stream, StreamExt};
 use http_body_util::{BodyExt, Either, Full};
 use hyper::client::conn::http1::SendRequest;
 use hyper::service::Service;
@@ -10,9 +11,10 @@ use hyper::{
 };
 use ipld_traversal::{
     blockstore::Blockstore, selector::RecursionLimit, unixfs::unixfs_path_selector, BlockLoader,
-    BlockTraversal, IterError, LinkSystem, Prefix, Selector,
+    BlockTraversal, IterError, LinkSystem, Prefix, Selector, TraversalValidator,
 };
 use libipld::Cid;
+use par_stream::prelude::*;
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
 use serde_ipld_dagcbor::{from_reader, from_slice, to_vec};
@@ -148,13 +150,56 @@ impl<S: Blockstore> Body for TraversalBody<S> {
     }
 }
 
+pin_project! {
+    pub struct StreamBody<B: Body> {
+        #[pin]
+        inner: B,
+        length_codec: codec::UviBytes,
+        buf: BytesMut,
+    }
+}
+
+impl<B: Body> StreamBody<B> {
+    pub fn new(inner: B) -> Self {
+        StreamBody {
+            inner,
+            length_codec: codec::UviBytes::default(),
+            buf: BytesMut::with_capacity(1024),
+        }
+    }
+}
+
+impl<B: Body + std::marker::Unpin> Stream for StreamBody<B> {
+    type Item = std::result::Result<BytesMut, <B as Body>::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        loop {
+            match this.inner.as_mut().poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(chunk) = frame.into_data() {
+                        this.buf.put(chunk);
+                    }
+                    if let Some(packet) = this.length_codec.decode(&mut this.buf).unwrap() {
+                        return Poll::Ready(Some(Ok(packet)));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            };
+        }
+    }
+}
+
 pub struct Client<S: Blockstore> {
     sender: SendRequest<Full<Bytes>>,
     addr: &'static str,
     store: S,
 }
 
-impl<S: Blockstore + Clone> Client<S> {
+impl<S: Blockstore + Clone + Send + 'static> Client<S> {
     pub fn new(sender: SendRequest<Full<Bytes>>, addr: &'static str, store: S) -> Self {
         Client {
             sender,
@@ -171,32 +216,37 @@ impl<S: Blockstore + Clone> Client<S> {
             .body(Full::new(Bytes::from(to_vec(&greq).unwrap())))
             .unwrap();
 
-        let mut res = self.sender.send_request(req).await.unwrap();
-
-        let mut length_codec: codec::UviBytes = codec::UviBytes::default();
-        let mut buf = BytesMut::new();
-        let mut size = 0;
+        let res = self.sender.send_request(req).await.unwrap();
 
         let store = self.store.clone();
 
-        while let Some(next) = res.frame().await {
-            if let Some(chunk) = next.unwrap().data_ref() {
-                buf.put(&chunk[..]);
+        let validator = greq
+            .selector
+            .as_ref()
+            .map(|sel| TraversalValidator::new(root, sel.clone()))
+            .unwrap();
 
-                if let Some(packet) = length_codec.decode(&mut buf).unwrap() {
-                    let pack = packet.freeze();
-                    let blk: GushBlock = from_slice(&pack).unwrap();
+        let col: Vec<_> = StreamBody::new(res)
+            .par_map(None, move |packet| {
+                let mut shared_val = validator.clone();
+                let store = store.clone();
+                move || {
+                    let buf = packet.unwrap();
+                    let blk: GushBlock = from_slice(&buf).unwrap();
                     let prefix = Prefix::new_from_bytes(blk.prefix).unwrap();
                     let cid = prefix.to_cid(blk.data).unwrap();
-
-                    size += blk.data.len();
-
-                    store.put_keyed(&cid, blk.data)?;
+                    if let Ok(()) = shared_val.next(&cid, blk.data) {
+                        store.put_keyed(&cid, blk.data).unwrap();
+                        blk.data.len()
+                    } else {
+                        0
+                    }
                 }
-            }
-        }
+            })
+            .collect()
+            .await;
 
-        Ok(size)
+        Ok(col.iter().sum())
     }
 
     pub async fn fetch_raw(&mut self, root: Cid) -> Result<usize> {
@@ -227,7 +277,6 @@ impl<S: Blockstore + Clone> Client<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::prelude::*;
     use http_body_util::{BodyExt, Empty, StreamBody};
     use hyper::server::conn::http1;
     use ipld_traversal::{blockstore::MemoryBlockstore, Prefix};
