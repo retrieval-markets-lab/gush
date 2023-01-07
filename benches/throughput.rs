@@ -99,7 +99,7 @@ fn chunks(size: usize) -> (MemoryBlockstore, Cid) {
             let leaf = Ipld::Bytes(chunk.to_vec());
             // encoding as raw
             let cid = lsys
-                .store(Prefix::new(0x55, 0x13), &leaf)
+                .store(Prefix::new(0x55, 0x12), &leaf)
                 .expect("link system should store leaf node");
             let link = ipld!({
                 "Hash": cid,
@@ -114,7 +114,7 @@ fn chunks(size: usize) -> (MemoryBlockstore, Cid) {
     });
 
     let root = lsys
-        .store(Prefix::new(0x71, 0x13), &root_node)
+        .store(Prefix::new(0x71, 0x12), &root_node)
         .expect("link system to store root node");
 
     (store, root)
@@ -129,6 +129,7 @@ fn throughput_chunked_small_payload(b: &mut test::Bencher) {
 fn throughput_chunked_mid_payload(b: &mut test::Bencher) {
     bench_server!(b, || chunks(10 * 1024 * 1024))
 }
+
 // #[bench]
 // fn throughput_regular_http(b: &mut test::Bencher) {
 //     static S: &[&[u8]] = &[&[b'x'; 250 * 1024] as &[u8]; 40] as _;
